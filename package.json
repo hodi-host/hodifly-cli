@@ -1,0 +1,37 @@
+{
+  "name": "hodifly",
+  "version": "1.0.0",
+  "description": "Deploy from git on cPanel. Command line for Hodifly projects: deploy, roll back, tail build logs.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hodi-host/hodifly-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hodi-host/hodifly-cli/issues"
+  },
+  "bin": {
+    "hodifly": "bin/hodifly.js"
+  },
+  "type": "commonjs",
+  "files": [
+    "bin/hodifly.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "hodifly",
+    "cpanel",
+    "deploy",
+    "deployment",
+    "git",
+    "cli"
+  ],
+  "homepage": "https://hodifly.app",
+  "license": "MIT",
+  "preferGlobal": true,
+  "publishConfig": {
+    "access": "public"
+  }
+}
