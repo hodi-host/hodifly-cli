@@ -1,0 +1,31 @@
+# Publish to npm when a GitHub release is published.
+#
+# No NPM_TOKEN anywhere: npm trusts this workflow through OIDC (Trusted Publisher), so the right to
+# publish belongs to the repository rather than to any person's account. That also gets the package
+# a provenance attestation automatically, tying the tarball to the commit that produced it.
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # the OIDC token npm checks; without this the publish is rejected
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or newer, which is ahead of what setup-node bundles.
+      - run: npm install -g npm@latest
+
+      - run: npm publish
