@@ -1,6 +1,6 @@
 {
   "name": "hodifly",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Deploy from git on cPanel. Command line for Hodifly projects: deploy, roll back, tail build logs.",
   "repository": {
     "type": "git",
@@ -21,6 +21,7 @@
     "node": ">=18"
   },
   "keywords": [
+    "hodi",
     "hodifly",
     "cpanel",
     "deploy",

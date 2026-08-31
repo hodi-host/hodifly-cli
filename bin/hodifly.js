@@ -24,7 +24,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const PROG = 'hodifly';
 
 // ---------------------------------------------------------------------------------------------
@@ -81,7 +81,9 @@ async function call(profile, fn, args = {}) {
   const url = `https://${profile.host}:2083/execute/Hodifly/${fn}`;
   const body = new URLSearchParams();
   for (const [k, v] of Object.entries(args)) {
-    if (v !== undefined && v !== null && v !== '') body.append(k, String(v));
+    // An EMPTY string is sent, not dropped: on `projects set` it is how a field is cleared
+    // (--build-command "" means "no build"), which the server reads differently from an absent key.
+    if (v !== undefined && v !== null) body.append(k, String(v));
   }
 
   // cPanel hosts usually carry a valid certificate for their hostname. When one does not, this is
@@ -367,9 +369,17 @@ async function cmdRefresh() {
 async function cmdProjects(args, opts) {
   const cfg = readConfig();
   if (args[0] === 'add' || args[0] === 'create') return cmdCreate(args.slice(1), opts);
+  if (args[0] === 'set' || args[0] === 'update' || args[0] === 'edit') return cmdSet(args.slice(1), opts);
   const { profile } = pick(cfg, opts, null);
   show('projects', await call(profile, 'list_projects'));
 }
+
+// The build settings, shared by `projects add` and `projects set`. Vercel's names where Vercel has
+// one; the domain, the folder on the account and every secret are deliberately absent from `set`,
+// because those belong to the installation rather than to the project's configuration.
+const SETTINGS = ['branch', 'root_directory', 'build_command', 'output_directory', 'framework',
+                  'runtime', 'mode', 'docroot', 'startup', 'previews', 'rebuild_every'];
+const SET_ONLY = ['autodeploy', 'notify_success', 'notify_failed', 'notify_email', 'persist'];
 
 async function cmdCreate(args, opts) {
   const cfg = readConfig();
@@ -380,9 +390,7 @@ async function cmdCreate(args, opts) {
   }
   const { profile } = pick(cfg, opts, opts.domain, { asProject: false });
   const send = {};
-  for (const key of ['repo', 'domain', 'directory', 'branch', 'root_directory', 'build_command',
-                     'output_directory', 'framework', 'runtime', 'mode', 'docroot', 'startup',
-                     'previews', 'rebuild_every']) {
+  for (const key of ['repo', 'domain', 'directory', ...SETTINGS]) {
     if (opts[key] !== undefined) send[key] = opts[key];
   }
   const out = await call(profile, 'create_project', send);
@@ -390,6 +398,29 @@ async function cmdCreate(args, opts) {
   // The new project is not in the cached index yet, and the very next command is usually about it.
   await reindex(cfg.profiles[profile.name]);
   if (cfg.profiles[profile.name]) writeConfig(cfg);
+}
+
+// Change settings on a project that already exists. A PATCH: only what you name is sent, and
+// anything you leave out stays as it is. Nothing is built here - the new settings apply to the next
+// deploy, so `hodifly deploy <project>` is the usual follow-up.
+async function cmdSet(args, opts) {
+  const typed = need(args[0],
+    `which project? ${PROG} projects set <project> --startup dist/main.js`);
+  const cfg = readConfig();
+  const { profile, subject: project } = pick(cfg, opts, typed);
+
+  const send = { project };
+  for (const key of [...SETTINGS, ...SET_ONLY]) {
+    if (opts[key] !== undefined) send[key] = opts[key];
+  }
+  if (Object.keys(send).length === 1) {
+    throw new ApiError(`nothing to change. Name a setting, for example:\n` +
+      `  ${PROG} projects set ${typed} --startup dist/main.js`);
+  }
+
+  const out = await call(profile, 'update_project', send);
+  show('json', out);
+  if (!wantJson()) console.log(`Saved. It applies to the next build: ${PROG} deploy ${typed}`);
 }
 
 async function cmdDeploy(args, opts) {
@@ -470,6 +501,7 @@ function usage() {
 
   ${PROG} projects                             list your projects and their status
   ${PROG} projects add --repo O/R --domain D   set up a new project from a repository
+  ${PROG} projects set <project> --startup F   change settings on an existing project
   ${PROG} deploy <project>                     build and publish the current branch head
   ${PROG} ls <project> [--prod]                list deployments, newest first
   ${PROG} rollback <project> <deployment>      re-point the site at an earlier deployment
@@ -491,9 +523,16 @@ Options for "projects add", named as Vercel names them:
   --runtime R           node:22, php:8.3, python:3.12, ruby:3.3, none
   --mode M              static | node | python | php | ruby
   --docroot DIR         php: the front-controller folder (public)
-  --startup FILE        node/python/ruby: the entry file Passenger runs
+  --startup FILE        node/python: the entry file Passenger runs (server.js, dist/main.js)
   --previews            build a preview URL for each pull request
   --rebuild-every N     also rebuild on a timer: 0, 60, 1440, 10080 (minutes)
+
+"projects set" takes the same settings, plus --autodeploy, --notify-success, --notify-failed,
+--notify-email and --persist. Only what you name changes; everything else stays as it is. Give a
+switch a value to turn it off (--previews 0), and an empty value to clear a field
+(--build-command ""). The domain, the folder on the account and the repository cannot be changed
+here: those belong to the installation, and a repository on a second domain is a second project.
+A repo that carries a hodifly.json is simpler still - what it declares wins on every deploy.
 
 Global:
   --profile NAME        act on that account

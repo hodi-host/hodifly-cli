@@ -10,11 +10,11 @@ One file, no dependencies, Node 18+. macOS, Linux and Windows.
 
 ## Install
 
-```
-pnpm add -g hodifly
-```
+Use whichever package manager you already have:
 
-or `npm i -g hodifly`, or `yarn global add hodifly`.
+- `pnpm add -g hodifly`
+- `npm i -g hodifly`
+- `yarn global add hodifly`.
 
 ## Sign in
 
@@ -51,6 +51,20 @@ hodifly projects add \
   --output-directory dist
 ```
 
+Change a setting on a project that already exists:
+
+```
+hodifly projects set my-api --startup dist/main.js   # the file Passenger boots (NestJS builds here)
+hodifly projects set my-site --build-command ""      # an empty value clears a field
+hodifly projects set my-site --previews 0            # a value turns a switch off
+```
+
+It is a patch: only what you name changes, and nothing is built until the next deploy. The domain,
+the folder on the account and the repository are not editable here, because those belong to the
+installation rather than to the project - a repository published to a second domain is a second
+project. A repository carrying a `hodifly.json` needs none of this: what that file declares wins on
+every deploy.
+
 `hodifly --help` lists every option. They are named the way Vercel names them: `--build-command`,
 `--output-directory`, `--root-directory`, `--framework`.
 
@@ -84,6 +98,7 @@ curl -H "Authorization: cpanel USER:TOKEN" \
 | --- | --- |
 | `projects` | `list_projects` |
 | `projects add` | `create_project` |
+| `projects set` | `update_project` |
 | `deploy` | `create_deployment` |
 | `ls` | `list_deployments` |
 | `rollback` | `rollback_deployment` |

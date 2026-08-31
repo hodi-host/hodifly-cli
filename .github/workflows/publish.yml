@@ -1,4 +1,9 @@
-# Publish to npm when a GitHub release is published.
+# Publish to npm: on a v* tag, on a published GitHub release, or by hand.
+#
+# The tag is the everyday path - `npm version patch && git push --follow-tags` is the whole release.
+# A GitHub release still works for the times you want notes to go with it; use ONE of the two per
+# version, because the second one to run tries to publish a version that already exists and npm
+# refuses it (a red run, nothing worse).
 #
 # No NPM_TOKEN anywhere: npm trusts this workflow through OIDC (Trusted Publisher), so the right to
 # publish belongs to the repository rather than to any person's account. That also gets the package
@@ -6,6 +11,9 @@
 name: publish
 
 on:
+  push:
+    tags:
+      - 'v*'
   release:
     types: [published]
   workflow_dispatch:
