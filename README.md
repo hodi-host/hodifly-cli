@@ -68,6 +68,42 @@ every deploy.
 `hodifly --help` lists every option. They are named the way Vercel names them: `--build-command`,
 `--output-directory`, `--root-directory`, `--framework`.
 
+## Environment variables
+
+A project's variables are stored on the server, encrypted, and written into the app's `.env` on
+every deploy. Editing them here edits that stored set; nothing changes on the site until the next
+deploy, so add `--deploy` to build straight away. (A `.env` edited by hand on the server does not
+last: the next deploy rewrites it.)
+
+```
+hodifly env my-site                         # names, set or empty, build-only marked; no values
+hodifly env --show my-site                  # the same with the values
+hodifly env get DATABASE_URL my-site        # the raw value, for scripts
+hodifly env set APP_DEBUG=0 MAIL_FROM=hi@example.com my-site
+hodifly env set SENTRY_AUTH_TOKEN=- my-site --build-only   # value read from stdin, not typed on the line
+hodifly env unset OLD_KEY my-site --deploy
+hodifly env import .env.production my-site  # merge a dotenv file (--replace: the file becomes the whole set)
+hodifly env export my-site > .env.backup    # dotenv, values double-quoted, imports back unchanged
+hodifly env edit my-site                    # open them in $EDITOR, review the diff, apply in one call
+```
+
+- **The project** is the argument left over once keys and files are taken, or `--project NAME`
+  when it could be mistaken for a variable name. With a single project on the account it can be
+  left out.
+- **`KEY=-`** reads that value from standard input (`pbpaste | hodifly env set KEY=- my-site`), or
+  asks for it without echo on a terminal, so a secret never lands in shell history.
+- **Build-only** variables reach the build and are kept out of the running app. `edit` and
+  `export` mark them with a `# build-only` line directly above the variable.
+- **`edit`** writes the variables to a private temporary file (owner-only, deleted afterwards),
+  opens `$VISUAL` or `$EDITOR` (`vi`, or Notepad on Windows), then shows what was added, changed
+  and removed, by name only, and asks before sending anything.
+- **`--show`, `get` and `export` print secrets.** Redirect them rather than leave them on screen;
+  the CLI warns when they go to a terminal.
+
+Files are read the usual dotenv way: `#` comments, an optional `export ` prefix, `'single quotes'`
+taken literally, `"double quotes"` understanding `\n`, `\"` and `\\` and spanning several lines,
+and a ` #` starting a comment after an unquoted value.
+
 ## More than one account
 
 Hosting accounts live on different servers, so `hodifly login` remembers each one as a profile and
@@ -104,6 +140,12 @@ curl -H "Authorization: cpanel USER:TOKEN" \
 | `rollback` | `rollback_deployment` |
 | `logs` | `get_deployment_logs` |
 | `remove` | `delete_project` |
+| `env`, `env --show`, `env get`, `env export` | `list_env` (`reveal=1` for values) |
+| `env set`, `env unset`, `env edit` | `set_env` |
+| `env import` | `import_env` |
+
+Variable values are only ever sent in the POST body, never in a URL, so they stay out of the
+server's access logs.
 
 ## Environment
 
@@ -113,6 +155,7 @@ curl -H "Authorization: cpanel USER:TOKEN" \
 | `HODIFLY_PROFILE` | Use that saved profile |
 | `HODIFLY_CONFIG_DIR` | Where profiles live (default `~/.hodifly`) |
 | `HODIFLY_INSECURE=1` | Accept a cPanel server whose TLS certificate does not validate |
+| `VISUAL`, `EDITOR` | The editor `hodifly env edit` opens |
 
 ## Requirements
 

@@ -23,8 +23,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const readline = require('readline');
+const { spawnSync } = require('child_process');
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 const PROG = 'hodifly';
 
 // ---------------------------------------------------------------------------------------------
@@ -427,6 +428,11 @@ async function cmdDeploy(args, opts) {
   const typed = need(args[0], `which project? ${PROG} deploy <project>`);
   const cfg = readConfig();
   const { profile, subject: project } = pick(cfg, opts, typed);
+  await startDeployment(profile, project);
+}
+
+// One place that starts a build, so `env ... --deploy` behaves exactly like `hodifly deploy`.
+async function startDeployment(profile, project) {
   show('json', await call(profile, 'create_deployment', { project }));
 }
 
@@ -462,6 +468,453 @@ async function cmdRemove(args, opts) {
   if (cfg.profiles[profile.name]) writeConfig(cfg);
 }
 
+// ---------------------------------------------------------------------------------------------
+// env: the project's environment variables
+//
+// They live on the server, encrypted, and the engine writes them into shared/.env on EVERY deploy.
+// So editing them here means editing the stored set and redeploying: shared/.env itself is never
+// touched, because whatever is written there by hand is gone at the next build.
+//
+// Values travel in the POST body only (call() never builds a query string), so they stay out of
+// the server's access logs. Error messages name keys and line numbers, never values.
+// ---------------------------------------------------------------------------------------------
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const BUILD_ONLY_MARK = '# build-only';
+
+// Parse dotenv text into ordered maps. The rules match the server's import_env, so whatever `edit`
+// accepts the server accepts too:
+//   blank lines and # comments skipped, optional `export ` prefix, KEY=value;
+//   'single quotes' are literal; "double quotes" understand \n, \" and \\ and may span lines;
+//   unquoted values are trimmed, and a ` #` starts an inline comment.
+// A `# build-only` comment line directly above a variable marks it build-only (used by `edit` and
+// written by `export`; the server's import ignores it like any other comment).
+// The last definition of a key wins. Throws on malformed input, naming the line, never a value.
+function parseDotenv(text) {
+  const vars = new Map();
+  const buildOnly = new Set();
+  const src = String(text).replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  const lines = src.split('\n');
+  let marked = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineNo = i + 1;
+    const raw = lines[i];
+    const t = raw.trim();
+    if (t === '') { marked = false; continue; }
+    if (t.startsWith('#')) {
+      marked = t.toLowerCase() === BUILD_ONLY_MARK;
+      continue;
+    }
+
+    let rest = raw.replace(/^[ \t]+/, '');
+    rest = rest.replace(/^export[ \t]+/, '');
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)[ \t]*=/.exec(rest);
+    if (!m) throw new ApiError(`line ${lineNo}: expected KEY=value with a name made of letters, digits and _`);
+    const key = m[1];
+    rest = rest.slice(m[0].length).replace(/^[ \t]+/, '');
+
+    let value;
+    if (rest.startsWith('"')) {
+      // Double quotes: walk character by character, possibly over several lines.
+      let out = '';
+      let j = 1;
+      let buf = rest;
+      let closed = false;
+      for (;;) {
+        if (j >= buf.length) {
+          if (i + 1 >= lines.length) break;
+          out += '\n';
+          i++;
+          buf = lines[i];
+          j = 0;
+          continue;
+        }
+        const c = buf[j];
+        if (c === '\\' && j + 1 < buf.length) {
+          const n = buf[j + 1];
+          if (n === 'n') out += '\n';
+          else if (n === '"') out += '"';
+          else if (n === '\\') out += '\\';
+          else out += '\\' + n;          // unknown escapes are kept as written
+          j += 2;
+          continue;
+        }
+        if (c === '"') { closed = true; j++; break; }
+        out += c;
+        j++;
+      }
+      if (!closed) throw new ApiError(`${key} (line ${lineNo}): the double quote is never closed`);
+      const tail = buf.slice(j);
+      if (tail.trim() !== '' && !tail.trim().startsWith('#')) {
+        throw new ApiError(`${key} (line ${i + 1}): unexpected text after the closing quote`);
+      }
+      value = out;
+    } else if (rest.startsWith("'")) {
+      const end = rest.indexOf("'", 1);
+      if (end < 0) throw new ApiError(`${key} (line ${lineNo}): the single quote is never closed on this line`);
+      const tail = rest.slice(end + 1);
+      if (tail.trim() !== '' && !tail.trim().startsWith('#')) {
+        throw new ApiError(`${key} (line ${lineNo}): unexpected text after the closing quote`);
+      }
+      value = rest.slice(1, end);
+    } else {
+      const hash = rest.search(/[ \t]#/);
+      value = (hash >= 0 ? rest.slice(0, hash) : rest).trim();
+    }
+
+    vars.set(key, value);
+    if (marked) buildOnly.add(key); else buildOnly.delete(key);
+    marked = false;
+  }
+  return { vars, buildOnly };
+}
+
+// Always double-quoted, escaping exactly what parseDotenv (and the server) unescape, so the output
+// of `export` imports back unchanged.
+function quoteDotenv(value) {
+  return '"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"';
+}
+
+function serializeDotenv(vars, buildOnly) {
+  let out = '';
+  for (const [k, v] of vars) {
+    if (buildOnly.has(k)) out += BUILD_ONLY_MARK + '\n';
+    out += `${k}=${quoteDotenv(v)}\n`;
+  }
+  return out;
+}
+
+// list_env answers an array; turn it into the same shape parseDotenv returns.
+function envFromList(data) {
+  const vars = new Map();
+  const buildOnly = new Set();
+  for (const v of (data && data.vars) || []) {
+    vars.set(v.name, v.value === undefined || v.value === null ? '' : String(v.value));
+    if (Number(v.build_only)) buildOnly.add(v.name);
+  }
+  return { vars, buildOnly };
+}
+
+// Which project an env command is about. Positionals mix keys, files and the project, so:
+//   --project NAME   always wins
+//   otherwise the positional the subcommand leaves over (see cmdEnv), and
+//   with none, the account's only project, when it has exactly one.
+function envTarget(cfg, opts, typed, example) {
+  const name = typeof opts.project === 'string' ? opts.project : typed;
+  if (name) {
+    const { profile, subject } = pick(cfg, opts, name);
+    return { profile, project: subject, typed: name };
+  }
+  const { profile } = pick(cfg, opts, null);
+  const sites = profile.sites || [];
+  if (sites.length === 1) return { profile, project: sites[0].name, typed: sites[0].name };
+  throw new ApiError(`which project? ${example}`);
+}
+
+// A positional that is not a shell-valid name, or that is exactly a known project or domain, is the
+// project; anything else is a key. --project removes any doubt.
+function looksLikeProject(cfg, a) {
+  if (!ENV_NAME.test(a)) return true;
+  return profileList(cfg).some((p) => (p.sites || []).some((s) => s.name === a || s.domain === a));
+}
+
+function warnSecretsOnTty() {
+  if (process.stdout.isTTY) {
+    console.error(`${PROG}: warning: printing secret values to the terminal. Redirect to a file instead, e.g. > .env.prod`);
+  }
+}
+
+async function confirm(question) {
+  if (!process.stdin.isTTY) return false;
+  const a = await ask(question);
+  return /^y(es)?$/i.test(a);
+}
+
+function readStdin() {
+  try {
+    return fs.readFileSync(0, 'utf8');
+  } catch (e) {
+    throw new ApiError('could not read from standard input.');
+  }
+}
+
+// What a write changed, by name only, then either the deploy or the hint to run one.
+async function afterEnvWrite(out, profile, project, typed, opts) {
+  if (wantJson()) console.log(JSON.stringify(out, null, 2));
+  else {
+    const o = out || {};
+    const lines = [];
+    for (const [label, list] of [['added', o.added], ['changed', o.changed], ['removed', o.removed]]) {
+      if (list && list.length) lines.push(`  ${label.padEnd(8)} ${list.join(', ')}`);
+    }
+    if (lines.length) console.log(`${project}:\n${lines.join('\n')}`);
+    else console.log(`${project}: nothing changed.`);
+  }
+  if (opts.deploy) {
+    await startDeployment(profile, project);
+  } else if (!wantJson()) {
+    console.log(`Applied at the next deploy. Run: ${PROG} deploy ${typed}`);
+  }
+}
+
+async function cmdEnv(args, opts) {
+  const cfg = readConfig();
+  const SUBS = ['list', 'ls', 'get', 'set', 'add', 'unset', 'rm', 'remove', 'import', 'export', 'edit', 'help'];
+  const sub = SUBS.includes(args[0]) ? args.shift() : 'list';
+
+  if (sub === 'help') return envUsage();
+
+  if (sub === 'list' || sub === 'ls') {
+    const { profile, project } = envTarget(cfg, opts, args[0], `${PROG} env <project>`);
+    const reveal = !!opts.show;
+    if (reveal) warnSecretsOnTty();
+    const data = await call(profile, 'list_env', { project, reveal: reveal ? 1 : 0 });
+    if (wantJson()) return console.log(JSON.stringify(data, null, 2));
+    const vars = (data && data.vars) || [];
+    const shown = (v) => {
+      const s = v === undefined || v === null ? '' : String(v);
+      return /[\x00-\x1f"]/.test(s) ? quoteDotenv(s).replace(/\r/g, '\\r').replace(/\t/g, '\\t') : s;
+    };
+    table(vars.map((v) => {
+      const row = [v.name, Number(v.set) ? 'set' : 'empty', Number(v.build_only) ? 'build-only' : 'build + app'];
+      if (reveal) row.push(shown(v.value));
+      return row;
+    }), reveal ? ['NAME', 'STATUS', 'SCOPE', 'VALUE'] : ['NAME', 'STATUS', 'SCOPE']);
+    return;
+  }
+
+  if (sub === 'get') {
+    const key = need(args[0], `which variable? ${PROG} env get KEY [project]`);
+    if (!ENV_NAME.test(key)) throw new ApiError(`"${key}" is not a valid variable name.`);
+    const { profile, project } = envTarget(cfg, opts, args[1], `${PROG} env get ${key} <project>`);
+    const data = await call(profile, 'list_env', { project, reveal: 1 });
+    const hit = ((data && data.vars) || []).find((v) => v.name === key);
+    if (!hit) throw new ApiError(`${key} is not defined on ${project}.`);
+    const value = hit.value === undefined || hit.value === null ? '' : String(hit.value);
+    // Raw bytes when piped or captured; a newline only to keep an interactive prompt tidy.
+    process.stdout.write(process.stdout.isTTY ? value + '\n' : value);
+    return;
+  }
+
+  if (sub === 'set' || sub === 'add') {
+    const pairs = [];
+    let typed;
+    for (const a of args) {
+      const eq = a.indexOf('=');
+      if (eq > 0) pairs.push([a.slice(0, eq), a.slice(eq + 1)]);
+      else if (typed === undefined && typeof opts.project !== 'string') typed = a;
+      else throw new ApiError(`unexpected argument "${a}". Variables are given as KEY=VALUE.`);
+    }
+    if (!pairs.length) throw new ApiError(`nothing to set. ${PROG} env set KEY=VALUE [KEY=VALUE...] [project]`);
+    for (const [k] of pairs) {
+      if (!ENV_NAME.test(k)) throw new ApiError(`"${k}" is not a valid variable name (letters, digits and _, not starting with a digit).`);
+    }
+
+    // KEY=- keeps a secret out of shell history: from a pipe, or typed without echo on a terminal.
+    const fromStdin = pairs.filter(([, v]) => v === '-');
+    if (fromStdin.length > 1 && !process.stdin.isTTY) {
+      throw new ApiError('only one KEY=- can read from a pipe. Set the others separately.');
+    }
+    const { profile, project, typed: label } = envTarget(cfg, opts, typed, `${PROG} env set KEY=VALUE <project>`);
+    const vars = Object.create(null);   // __proto__ is a valid variable name
+    for (const [k, v] of pairs) {
+      if (v !== '-') { vars[k] = v; continue; }
+      if (process.stdin.isTTY) vars[k] = await ask(`Value for ${k}: `, { silent: true });
+      else vars[k] = readStdin().replace(/\r?\n$/, '');
+    }
+    const send = { project, vars: JSON.stringify(vars) };
+    if (opts.build_only) {
+      const flags = Object.create(null);
+      for (const [k] of pairs) flags[k] = true;
+      send.build_only = JSON.stringify(flags);
+    }
+    return afterEnvWrite(await call(profile, 'set_env', send), profile, project, label, opts);
+  }
+
+  if (sub === 'unset' || sub === 'rm' || sub === 'remove') {
+    const names = [];
+    let typed;
+    for (const a of args) {
+      if (typed === undefined && typeof opts.project !== 'string' && looksLikeProject(cfg, a)) typed = a;
+      else if (ENV_NAME.test(a)) names.push(a);
+      else throw new ApiError(`"${a}" is not a valid variable name.`);
+    }
+    if (!names.length) throw new ApiError(`which variable? ${PROG} env unset KEY [KEY...] [project]`);
+    const { profile, project, typed: label } = envTarget(cfg, opts, typed, `${PROG} env unset ${names.join(' ')} --project <project>`);
+    const out = await call(profile, 'set_env', { project, unset: JSON.stringify(names) });
+    return afterEnvWrite(out, profile, project, label, opts);
+  }
+
+  if (sub === 'import') {
+    const file = need(args[0], `which file? ${PROG} env import .env [project] [--replace]`);
+    const { profile, project, typed: label } = envTarget(cfg, opts, args[1], `${PROG} env import ${file} <project>`);
+    let text;
+    if (file === '-') text = readStdin();
+    else {
+      try { text = fs.readFileSync(file, 'utf8'); } catch { throw new ApiError(`cannot read ${file}.`); }
+    }
+    // Parsed here too, so a malformed file is refused before anything is sent, and so a replace can
+    // say how many variables are about to become the whole set.
+    const parsed = parseDotenv(text);
+    if (opts.replace && !opts.yes) {
+      if (!process.stdin.isTTY) throw new ApiError('--replace removes every variable not in the file. Add --yes to confirm when not on a terminal.');
+      const ok = await confirm(`Replace ALL variables of ${project} with the ${parsed.vars.size} in ${file}? Any other is removed. [y/N] `);
+      if (!ok) return console.log('Nothing sent.');
+    }
+    const out = await call(profile, 'import_env', { project, text, mode: opts.replace ? 'replace' : 'merge' });
+    return afterEnvWrite(out, profile, project, label, opts);
+  }
+
+  if (sub === 'export') {
+    const { profile, project } = envTarget(cfg, opts, args[0], `${PROG} env export <project> > .env`);
+    warnSecretsOnTty();
+    const data = await call(profile, 'list_env', { project, reveal: 1 });
+    const { vars, buildOnly } = envFromList(data);
+    process.stdout.write(serializeDotenv(vars, buildOnly));
+    return;
+  }
+
+  if (sub === 'edit') return envEdit(cfg, args, opts);
+}
+
+function editorCommand() {
+  return process.env.VISUAL || process.env.EDITOR || (process.platform === 'win32' ? 'notepad' : 'vi');
+}
+
+function runEditor(file) {
+  const quoted = process.platform === 'win32' ? `"${file}"` : `'${file.replace(/'/g, `'\\''`)}'`;
+  // Through the shell, because $EDITOR is often a command line of its own ("code --wait").
+  const r = spawnSync(`${editorCommand()} ${quoted}`, { stdio: 'inherit', shell: true });
+  if (r.error) throw new ApiError(`could not start the editor (${editorCommand()}). Set $EDITOR.`);
+  if (r.status !== 0) throw new ApiError(`the editor exited with status ${r.status}; nothing sent.`);
+}
+
+// Compare two sets, by name. Values never appear in the result.
+function envDiff(before, after) {
+  const added = [];
+  const changed = [];
+  const removed = [];
+  const flagged = [];
+  for (const [k, v] of after.vars) {
+    if (!before.vars.has(k)) added.push(k);
+    else if (before.vars.get(k) !== v) changed.push(k);
+    const was = before.vars.has(k) && before.buildOnly.has(k);
+    const now = after.buildOnly.has(k);
+    if (before.vars.has(k) && was !== now) flagged.push([k, now]);
+  }
+  for (const k of before.vars.keys()) if (!after.vars.has(k)) removed.push(k);
+  return { added, changed, removed, flagged };
+}
+
+async function envEdit(cfg, args, opts) {
+  const { profile, project, typed } = envTarget(cfg, opts, args[0], `${PROG} env edit <project>`);
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new ApiError(`env edit needs a terminal. In a script, use: ${PROG} env set / env import`);
+  }
+  const before = envFromList(await call(profile, 'list_env', { project, reveal: 1 }));
+
+  // A private directory (mkdtemp is 0700) holding a 0600 file: the values are in clear while the
+  // editor is open, so nobody else on the machine may read them, and the finally removes both.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hodifly-env-'));
+  const file = path.join(dir, `${String(project).replace(/[^A-Za-z0-9._-]/g, '_')}.env`);
+  // A finally does not run when the process is killed, so a Ctrl-C or a closed terminal removes the
+  // file too. While the editor runs these fire once it exits, which is when cleaning up is safe.
+  const cleanup = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* gone */ } };
+  const onSignal = (sig) => { cleanup(); process.exit(sig === 'SIGINT' ? 130 : 143); };
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  for (const sig of signals) process.once(sig, onSignal);
+  try {
+    const header =
+      `# Environment variables of ${project}. Save and close the editor to review the changes.\n` +
+      `# Delete a line to remove that variable. A "${BUILD_ONLY_MARK}" line directly above a\n` +
+      `# variable keeps it out of the running app (visible to the build only).\n` +
+      `# Values in double quotes understand \\n, \\" and \\\\. Changes apply at the next deploy.\n\n`;
+    fs.writeFileSync(file, header + serializeDotenv(before.vars, before.buildOnly), { mode: 0o600, flag: 'wx' });
+    try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
+
+    let after;
+    for (;;) {
+      runEditor(file);
+      try {
+        after = parseDotenv(fs.readFileSync(file, 'utf8'));
+        const bad = [...after.vars.keys()].find((k) => !ENV_NAME.test(k));
+        if (bad) throw new ApiError(`"${bad}" is not a valid variable name.`);
+        break;
+      } catch (e) {
+        if (!(e instanceof ApiError)) throw e;
+        console.error(`${PROG}: ${e.message}`);
+        if (!(await confirm('Open the editor again? [y/N] '))) return console.log('Nothing sent.');
+      }
+    }
+
+    const d = envDiff(before, after);
+    if (!d.added.length && !d.changed.length && !d.removed.length && !d.flagged.length) {
+      return console.log(`No change to ${project}. Nothing sent.`);
+    }
+
+    console.log(`Changes to ${project} (values not shown):`);
+    for (const k of d.added) console.log(`  + ${k}${after.buildOnly.has(k) ? '  (build-only)' : ''}`);
+    for (const k of d.changed) console.log(`  ~ ${k}  (value changed)`);
+    for (const [k, now] of d.flagged) console.log(`  ~ ${k}  (${now ? 'now build-only' : 'no longer build-only'})`);
+    for (const k of d.removed) console.log(`  - ${k}`);
+    if (!opts.yes && !(await confirm('Apply? [y/N] '))) return console.log('Nothing sent.');
+
+    const send = { project };
+    const vars = Object.create(null);   // __proto__ is a valid variable name
+    for (const k of [...d.added, ...d.changed]) vars[k] = after.vars.get(k);
+    if (Object.keys(vars).length) send.vars = JSON.stringify(vars);
+    if (d.removed.length) send.unset = JSON.stringify(d.removed);
+    const flags = Object.create(null);
+    for (const k of d.added) if (after.buildOnly.has(k)) flags[k] = true;
+    for (const [k, now] of d.flagged) flags[k] = now;
+    if (Object.keys(flags).length) send.build_only = JSON.stringify(flags);
+
+    await afterEnvWrite(await call(profile, 'set_env', send), profile, project, typed, opts);
+  } finally {
+    cleanup();
+    for (const sig of signals) process.removeListener(sig, onSignal);
+  }
+}
+
+function envUsage() {
+  console.log(`${PROG} env - the environment variables of a project
+
+  ${PROG} env [project]                           names, set or empty, build-only marked (no values)
+  ${PROG} env --show [project]                    the same, with the values
+  ${PROG} env get KEY [project]                   the raw value only, for scripts
+  ${PROG} env set KEY=VALUE [KEY=VALUE...] [project] [--build-only] [--deploy]
+                                                  add or change; KEY=- reads that value from
+                                                  standard input (keeps it out of shell history)
+  ${PROG} env unset KEY [KEY...] [project] [--deploy]
+  ${PROG} env import FILE [project] [--replace] [--deploy]
+                                                  load a .env file (FILE - reads standard input);
+                                                  merges, or --replace removes everything else
+  ${PROG} env export [project] > .env.prod        dotenv on standard output, values double-quoted
+  ${PROG} env edit [project] [--deploy]           open the variables in $VISUAL / $EDITOR, review
+                                                  the changes, then apply them in one call
+
+The variables are stored on the server, encrypted, and written into the app's .env on every
+deploy, so a change applies at the next deploy (or right away with --deploy). Editing the .env
+on the server by hand does not last: the next deploy rewrites it.
+
+The project is the positional left over once keys and files are taken, or --project NAME. With a
+single project on the account it can be omitted. A build-only variable is visible to the build
+and kept out of the running app; in "edit" and "export" it carries a "${BUILD_ONLY_MARK}" line
+directly above it.
+
+--show, get and export print secret values: redirect them rather than leave them on screen.
+
+Options:
+  --project NAME   the project, when a positional could be read as a key
+  --show           list values too
+  --build-only     with set: mark these variables build-only
+  --replace        with import: the file becomes the whole set
+  --deploy         start a deployment once the change is saved
+  --yes            skip the confirmation (edit, import --replace)
+  --json           print the raw API response`);
+}
+
 function need(v, msg) {
   if (!v) throw new ApiError(msg);
   return v;
@@ -472,7 +925,10 @@ function need(v, msg) {
 // ---------------------------------------------------------------------------------------------
 
 // --flag value, or --flag on its own for a switch. Dashes become underscores, so --root-directory
-// arrives as root_directory: the name the API uses.
+// arrives as root_directory: the name the API uses. The SWITCHES never take a value, so a
+// positional after them stays a positional (`env --show my-site`, `ls --prod my-site`).
+const SWITCHES = new Set(['show', 'build_only', 'deploy', 'replace', 'yes', 'prod', 'production']);
+
 function parse(argv) {
   const args = [];
   const opts = {};
@@ -481,6 +937,7 @@ function parse(argv) {
     if (a === '--json') continue;
     if (a.startsWith('--')) {
       const key = a.slice(2).replace(/-/g, '_');
+      if (SWITCHES.has(key)) { opts[key] = true; continue; }
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith('--')) { opts[key] = next; i++; } else { opts[key] = true; }
     } else {
@@ -507,6 +964,13 @@ function usage() {
   ${PROG} rollback <project> <deployment>      re-point the site at an earlier deployment
   ${PROG} logs <project> [deployment]          build output (defaults to the newest deployment)
   ${PROG} remove <project>                     delete the project (files on disk are kept)
+
+  ${PROG} env [project] [--show]               the project's environment variables
+  ${PROG} env set KEY=VALUE [project]          add or change one (KEY=- reads it from stdin)
+  ${PROG} env unset KEY [project]              remove one
+  ${PROG} env edit [project]                   edit them all in $EDITOR, review, apply
+  ${PROG} env import FILE | export [project]   load or write a .env file
+                                               (${PROG} env --help for the details)
 
 <project> is a project name or its id. With several accounts signed in, the project or domain name
 picks the right server on its own; add --profile <name> when you want to be explicit.
@@ -552,10 +1016,12 @@ const COMMANDS = {
   rollback: cmdRollback,
   logs: cmdLogs, log: cmdLogs,
   remove: cmdRemove, rm: cmdRemove, delete: cmdRemove,
+  env: cmdEnv,
 };
 
 async function main() {
   const argv = process.argv.slice(2);
+  if (argv[0] === 'env' && (argv.includes('--help') || argv.includes('-h'))) return envUsage();
   if (argv.includes('--help') || argv.includes('-h') || argv.length === 0) return usage();
   if (argv.includes('--version')) return console.log(`${PROG} ${VERSION}`);
 
