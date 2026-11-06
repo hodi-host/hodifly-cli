@@ -104,6 +104,30 @@ Files are read the usual dotenv way: `#` comments, an optional `export ` prefix,
 taken literally, `"double quotes"` understanding `\n`, `\"` and `\\` and spanning several lines,
 and a ` #` starting a comment after an unquoted value.
 
+## Databases
+
+`db create` makes a MySQL or PostgreSQL database, a user with a generated password, and gives that
+user all privileges on it, in one command. The cPanel prefix (`youruser_`) is added when missing.
+
+```
+hodifly db                                        # databases on the account, with their users
+hodifly db create shop --project my-site --deploy # settings straight into the project, then deploy
+hodifly db create blog --engine postgresql --project my-blog
+hodifly db create crm >> .env                     # no project: the .env lines go to stdout
+```
+
+- **With `--project`**, the connection settings go into that project's environment variables and
+  are never printed: `DATABASE_URL` always, plus `DB_CONNECTION`, `DB_HOST`, `DB_PORT`,
+  `DB_DATABASE`, `DB_USERNAME` and `DB_PASSWORD` when the project is Laravel. The project is
+  checked before anything is created, so a typo leaves no orphan database.
+- **Without it**, the same lines (all of them) are printed on standard output and the summary on
+  standard error, so `>> .env` keeps only what belongs in the file. The password is shown once.
+- `--user` names the user when it should differ from the database. Nothing here deletes: remove a
+  database in cPanel.
+
+These are the rules the Hodi MCP server follows for `create_database`, so a database made by your
+AI assistant and one made here look the same.
+
 ## More than one account
 
 Hosting accounts live on different servers, so `hodifly login` remembers each one as a profile and

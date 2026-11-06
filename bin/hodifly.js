@@ -25,7 +25,7 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const PROG = 'hodifly';
 
 // ---------------------------------------------------------------------------------------------
@@ -78,8 +78,10 @@ function envProfile() {
 
 class ApiError extends Error {}
 
-async function call(profile, fn, args = {}) {
-  const url = `https://${profile.host}:2083/execute/Hodifly/${fn}`;
+// `module` is Hodifly for everything but `db`, which drives cPanel's own Mysql / Postgresql modules
+// with the same token.
+async function call(profile, fn, args = {}, module = 'Hodifly') {
+  const url = `https://${profile.host}:2083/execute/${module}/${fn}`;
   const body = new URLSearchParams();
   for (const [k, v] of Object.entries(args)) {
     // An EMPTY string is sent, not dropped: on `projects set` it is how a field is cleared
@@ -118,7 +120,9 @@ async function call(profile, fn, args = {}) {
       `  The token may have been revoked. Create a new one in cPanel > Manage API Tokens, then run: ${PROG} login`);
   }
   if (res.status === 404) {
-    throw new ApiError(`${profile.host} has no Hodifly API. Is Hodifly installed on that server?`);
+    throw new ApiError(module === 'Hodifly'
+      ? `${profile.host} has no Hodifly API. Is Hodifly installed on that server?`
+      : `${profile.host} does not offer ${module} on this account.`);
   }
 
   const text = await res.text();
@@ -915,6 +919,174 @@ Options:
   --json           print the raw API response`);
 }
 
+// ---------------------------------------------------------------------------------------------
+// databases
+//
+// `db create` does what anyone setting up an app needs in one go - database, user with a generated
+// password, all privileges - through cPanel's own Mysql / Postgresql modules, with the same token.
+// The rules match the Hodi MCP's create_database, so both name things the same way:
+//   - the cPanel prefix (user_) is added when missing;
+//   - with --project, the connection settings go straight into that project's environment
+//     variables (DATABASE_URL, plus DB_* when the project is Laravel) and are never printed;
+//   - without it, the .env lines go to stdout (so `>> .env` works) and the rest to stderr.
+// Nothing here deletes: a database is removed in cPanel, where the consequences are visible.
+// ---------------------------------------------------------------------------------------------
+
+const DB_ENGINES = {
+  mysql:      { module: 'Mysql',      port: 3306, scheme: 'mysql',      connection: 'mysql' },
+  postgresql: { module: 'Postgresql', port: 5432, scheme: 'postgresql', connection: 'pgsql' },
+};
+
+function dbEngine(v) {
+  const e = String(v || 'mysql').toLowerCase();
+  const name = { mysql: 'mysql', mariadb: 'mysql', postgresql: 'postgresql', postgres: 'postgresql', pg: 'postgresql', pgsql: 'postgresql' }[e];
+  if (!name) throw new ApiError(`--engine is mysql or postgresql, not "${v}".`);
+  return name;
+}
+
+// 24 characters from an alphabet that needs no escaping in a URL, a shell or a .env file.
+function dbPassword() {
+  const { randomInt } = require('crypto');
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  let out = '';
+  for (let i = 0; i < 24; i++) out += alphabet[randomInt(alphabet.length)];
+  return out;
+}
+
+function dbPrefixed(name, prefix) {
+  const n = String(name || '').trim().toLowerCase();
+  return !n || n.startsWith(prefix) ? n : prefix + n;
+}
+
+// The project, looked up BEFORE anything is created: a typo there must not leave an orphan
+// database behind. Names are not unique on an account (several projects can deploy one repo), so a
+// name carried by two projects is refused and the ids are shown.
+async function dbProject(profile, subject) {
+  const list = (await call(profile, 'list_projects')) || [];
+  const hits = list.filter((p) => p.id === subject || p.name === subject);
+  if (hits.length === 1) return hits[0];
+  if (!hits.length) throw new ApiError(`no project "${subject}" on ${profile.name}. Run: ${PROG} projects`);
+  throw new ApiError(`${hits.length} projects are called "${subject}". Give the id instead:\n` +
+    hits.map((p) => `  ${p.id}  ${p.domain || ''}${p.base_dir && p.base_dir !== '.' ? ' (' + p.base_dir + ')' : ''}`).join('\n'));
+}
+
+async function cmdDb(args, opts) {
+  const cfg = readConfig();
+  const SUBS = ['list', 'ls', 'create', 'add', 'new', 'help'];
+  const sub = SUBS.includes(args[0]) ? args.shift() : 'list';
+  if (sub === 'help') return dbUsage();
+
+  if (sub === 'list' || sub === 'ls') {
+    const { profile } = pick(cfg, opts, null, { asProject: false });
+    const out = {};
+    const rows = [];
+    for (const [engine, e] of Object.entries(DB_ENGINES)) {
+      try {
+        out[engine] = (await call(profile, 'list_databases', {}, e.module)) || [];
+      } catch {
+        out[engine] = null;               // engine not offered on this account
+        continue;
+      }
+      for (const d of out[engine]) rows.push([d.database, engine, (d.users || []).join(', ') || '-']);
+    }
+    if (wantJson()) return console.log(JSON.stringify(out, null, 2));
+    if (!rows.length) return console.log('No databases on this account.');
+    return table(rows, ['DATABASE', 'ENGINE', 'USERS']);
+  }
+
+  // create
+  const name = need(args[0], `which name? ${PROG} db create NAME [--engine postgresql] [--project P]`);
+  const engine = dbEngine(opts.engine);
+  const e = DB_ENGINES[engine];
+  const projectArg = typeof opts.project === 'string' ? opts.project : args[1];
+  let profile;
+  let project = null;
+  if (projectArg) {
+    const r = pick(cfg, opts, projectArg);
+    profile = r.profile;
+    project = await dbProject(profile, r.subject);
+  } else {
+    profile = pick(cfg, opts, null, { asProject: false }).profile;
+  }
+
+  let restr = {};
+  try { restr = (await call(profile, 'get_restrictions', {}, e.module)) || {}; } catch (err) {
+    throw new ApiError(`${engine} is not available on ${profile.name}: ${err.message}`);
+  }
+  const prefix = restr.prefix || `${profile.user}_`;
+  const db = dbPrefixed(name, prefix);
+  const user = dbPrefixed(typeof opts.user === 'string' ? opts.user : name, prefix);
+  const maxDb = Number(restr.max_database_name_length) || 64;
+  const maxUser = Number(restr.max_username_length) || (engine === 'mysql' ? 47 : 63);
+  if (!/^[a-z0-9_]+$/.test(db) || db.length > maxDb) {
+    throw new ApiError(`"${db}" is not a valid database name: lower-case letters, digits and _, ${maxDb} characters at most with the prefix.`);
+  }
+  if (!/^[a-z0-9_]+$/.test(user) || user.length > maxUser) {
+    throw new ApiError(`"${user}" is not a valid user name: lower-case letters, digits and _, ${maxUser} characters at most with the prefix.`);
+  }
+
+  const password = dbPassword();
+  await call(profile, 'create_database', { name: db }, e.module);
+  const done = ['database'];
+  try {
+    await call(profile, 'create_user', { name: user, password }, e.module);
+    done.push('user');
+    if (engine === 'mysql') {
+      await call(profile, 'set_privileges_on_database', { user, database: db, privileges: 'ALL PRIVILEGES' }, e.module);
+    } else {
+      await call(profile, 'grant_all_privileges', { user, database: db }, e.module);
+    }
+    done.push('privileges');
+  } catch (err) {
+    // Say what exists rather than deleting it: the next step can be finished in cPanel.
+    throw new ApiError(`stopped after creating: ${done.join(', ')} (${db}). Finish in cPanel. ${err.message}`);
+  }
+
+  const url = `${e.scheme}://${encodeURIComponent(user)}:${encodeURIComponent(password)}@localhost:${e.port}/${encodeURIComponent(db)}`;
+  const env = { DATABASE_URL: url };
+  const laravel = /laravel/i.test(`${(project && project.framework) || ''} ${(project && project.runtime) || ''}`);
+  if (!project || laravel) {
+    Object.assign(env, {
+      DB_CONNECTION: e.connection, DB_HOST: 'localhost', DB_PORT: String(e.port),
+      DB_DATABASE: db, DB_USERNAME: user, DB_PASSWORD: password,
+    });
+  }
+
+  if (project) {
+    console.error(`Created ${engine} database ${db}, user ${user}, all privileges.`);
+    const out = await call(profile, 'set_env', { project: project.id, vars: JSON.stringify(env) });
+    return afterEnvWrite(out, profile, project.id, projectArg, opts);
+  }
+
+  if (wantJson()) {
+    return console.log(JSON.stringify({ engine, host: 'localhost', port: e.port, database: db, user, password, env }, null, 2));
+  }
+  console.error(`Created ${engine} database ${db}, user ${user}, all privileges.`);
+  console.error('The password is shown once, below. Keep it in your .env, not in your shell history.');
+  process.stdout.write(Object.entries(env).map(([k, v]) => `${k}=${quoteDotenv(v)}`).join('\n') + '\n');
+}
+
+function dbUsage() {
+  console.log(`${PROG} db - MySQL and PostgreSQL databases of the account
+
+  ${PROG} db                                       list them, with their users
+  ${PROG} db create NAME [--engine postgresql]      database + user + all privileges
+  ${PROG} db create NAME --project P [--deploy]     ...and put the settings into project P
+
+The cPanel prefix (user_) is added when missing. The password is generated (24 characters).
+With --project, DATABASE_URL (plus DB_* for Laravel) goes straight into the project's environment
+variables and is never printed. Without it, the .env lines are printed on stdout, so
+  ${PROG} db create shop >> .env
+keeps them in a file. Nothing here deletes: remove a database in cPanel.
+
+Options:
+  --engine E      mysql (default) or postgresql
+  --user U        the user name, when it should differ from the database name
+  --project P     the Hodifly project to receive the settings
+  --deploy        with --project: deploy once the settings are saved
+  --json          print everything as JSON (the password included)`);
+}
+
 function need(v, msg) {
   if (!v) throw new ApiError(msg);
   return v;
@@ -972,6 +1144,10 @@ function usage() {
   ${PROG} env import FILE | export [project]   load or write a .env file
                                                (${PROG} env --help for the details)
 
+  ${PROG} db                                   MySQL and PostgreSQL databases of the account
+  ${PROG} db create NAME [--project P]         database + user + privileges, settings into P
+                                               (${PROG} db --help for the details)
+
 <project> is a project name or its id. With several accounts signed in, the project or domain name
 picks the right server on its own; add --profile <name> when you want to be explicit.
 
@@ -1017,11 +1193,13 @@ const COMMANDS = {
   logs: cmdLogs, log: cmdLogs,
   remove: cmdRemove, rm: cmdRemove, delete: cmdRemove,
   env: cmdEnv,
+  db: cmdDb, database: cmdDb, databases: cmdDb,
 };
 
 async function main() {
   const argv = process.argv.slice(2);
   if (argv[0] === 'env' && (argv.includes('--help') || argv.includes('-h'))) return envUsage();
+  if (/^(db|databases?)$/.test(argv[0] || '') && (argv.includes('--help') || argv.includes('-h'))) return dbUsage();
   if (argv.includes('--help') || argv.includes('-h') || argv.length === 0) return usage();
   if (argv.includes('--version')) return console.log(`${PROG} ${VERSION}`);
 
