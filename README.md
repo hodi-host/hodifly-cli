@@ -117,10 +117,11 @@ hodifly db create crm >> .env                     # no project: the .env lines g
 ```
 
 - **With `--project`**, the connection settings go into that project's environment variables and
-  are never printed: `DATABASE_URL` always, plus `DB_CONNECTION`, `DB_HOST`, `DB_PORT`,
-  `DB_DATABASE`, `DB_USERNAME` and `DB_PASSWORD` when the project is Laravel. The project is
+  are never printed: `DATABASE_URL` (Rails, Django, Symfony, Prisma...) and `DB_CONNECTION`,
+  `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` (Laravel, CodeIgniter,
+  CakePHP...), both every time: an app ignores what it does not read. The project is
   checked before anything is created, so a typo leaves no orphan database.
-- **Without it**, the same lines (all of them) are printed on standard output and the summary on
+- **Without it**, the same lines are printed on standard output and the summary on
   standard error, so `>> .env` keeps only what belongs in the file. The password is shown once.
 - `--user` names the user when it should differ from the database. Nothing here deletes: remove a
   database in cPanel.

@@ -25,7 +25,7 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const PROG = 'hodifly';
 
 // ---------------------------------------------------------------------------------------------
@@ -927,7 +927,7 @@ Options:
 // The rules match the Hodi MCP's create_database, so both name things the same way:
 //   - the cPanel prefix (user_) is added when missing;
 //   - with --project, the connection settings go straight into that project's environment
-//     variables (DATABASE_URL, plus DB_* when the project is Laravel) and are never printed;
+//     variables (DATABASE_URL and DB_*) and are never printed;
 //   - without it, the .env lines go to stdout (so `>> .env` works) and the rest to stderr.
 // Nothing here deletes: a database is removed in cPanel, where the consequences are visible.
 // ---------------------------------------------------------------------------------------------
@@ -1043,14 +1043,14 @@ async function cmdDb(args, opts) {
   }
 
   const url = `${e.scheme}://${encodeURIComponent(user)}:${encodeURIComponent(password)}@localhost:${e.port}/${encodeURIComponent(db)}`;
-  const env = { DATABASE_URL: url };
-  const laravel = /laravel/i.test(`${(project && project.framework) || ''} ${(project && project.runtime) || ''}`);
-  if (!project || laravel) {
-    Object.assign(env, {
-      DB_CONNECTION: e.connection, DB_HOST: 'localhost', DB_PORT: String(e.port),
-      DB_DATABASE: db, DB_USERNAME: user, DB_PASSWORD: password,
-    });
-  }
+  // Both forms, always: DATABASE_URL for the frameworks that read a URL (Rails, Django, Symfony,
+  // Prisma...), DB_* for those that read separate variables (Laravel, CodeIgniter, CakePHP...).
+  // An app ignores what it does not read.
+  const env = {
+    DATABASE_URL: url,
+    DB_CONNECTION: e.connection, DB_HOST: 'localhost', DB_PORT: String(e.port),
+    DB_DATABASE: db, DB_USERNAME: user, DB_PASSWORD: password,
+  };
 
   if (project) {
     console.error(`Created ${engine} database ${db}, user ${user}, all privileges.`);
@@ -1074,7 +1074,7 @@ function dbUsage() {
   ${PROG} db create NAME --project P [--deploy]     ...and put the settings into project P
 
 The cPanel prefix (user_) is added when missing. The password is generated (24 characters).
-With --project, DATABASE_URL (plus DB_* for Laravel) goes straight into the project's environment
+With --project, DATABASE_URL and DB_* go straight into the project's environment
 variables and is never printed. Without it, the .env lines are printed on stdout, so
   ${PROG} db create shop >> .env
 keeps them in a file. Nothing here deletes: remove a database in cPanel.
