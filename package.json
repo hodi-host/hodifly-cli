@@ -1,6 +1,6 @@
 {
   "name": "hodifly",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "Deploy from git on cPanel. Command line for Hodifly projects: deploy, roll back, tail build logs, env vars, databases.",
   "repository": {
     "type": "git",

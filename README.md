@@ -68,6 +68,24 @@ every deploy.
 `hodifly --help` lists every option. They are named the way Vercel names them: `--build-command`,
 `--output-directory`, `--root-directory`, `--framework`.
 
+## Push from your machine (no GitHub, no GitLab)
+
+A project can also start from nothing: Hodifly hosts an empty repository on `git.hodifly.app`,
+and you push to it. The first push detects the framework and deploys; every later push to the
+branch deploys too. It is the path for an AI agent working in a folder on your machine.
+
+```
+hodifly projects add --push --domain example.com
+git remote add hodifly https://git.hodifly.app/<project id>.git
+git push hodifly main
+```
+
+git asks for credentials: any username, and the **push token** as the password. The token is
+shown once, by `projects add --push` or by `hodifly token my-site`; `hodifly remote my-site`
+lists the address and the tokens (never their values), `hodifly token my-site --revoke <id>`
+revokes one. Keep a copy of your code: the repository on Hodifly is a deploy mirror, not a
+backup.
+
 ## Environment variables
 
 A project's variables are stored on the server, encrypted, and written into the app's `.env` on
@@ -159,6 +177,8 @@ curl -H "Authorization: cpanel USER:TOKEN" \
 | --- | --- |
 | `projects` | `list_projects` |
 | `projects add` | `create_project` |
+| `remote` | `list_push_tokens` |
+| `token` | `create_push_token`, `revoke_push_token` |
 | `projects set` | `update_project` |
 | `deploy` | `create_deployment` |
 | `ls` | `list_deployments` |

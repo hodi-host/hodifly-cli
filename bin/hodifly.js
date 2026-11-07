@@ -25,7 +25,7 @@ const path = require('path');
 const readline = require('readline');
 const { spawnSync } = require('child_process');
 
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 const PROG = 'hodifly';
 
 // ---------------------------------------------------------------------------------------------
@@ -390,19 +390,65 @@ async function cmdCreate(args, opts) {
   const cfg = readConfig();
   // A create says which domain it is for, and a domain belongs to exactly one account, so that is
   // the strongest hint available for picking the profile.
-  if (!opts.repo || !opts.domain) {
-    throw new ApiError(`--repo and --domain are both required.\n  e.g. ${PROG} projects add --repo my-org/site --domain example.com`);
+  if (!opts.domain || (!opts.repo && !opts.push)) {
+    throw new ApiError(`--domain is required, with --repo O/R or --push.\n` +
+      `  e.g. ${PROG} projects add --repo my-org/site --domain example.com\n` +
+      `       ${PROG} projects add --push --domain example.com`);
   }
   const { profile } = pick(cfg, opts, opts.domain, { asProject: false });
   const send = {};
-  for (const key of ['repo', 'domain', 'directory', ...SETTINGS]) {
+  for (const key of ['repo', 'domain', 'directory', 'name', ...SETTINGS]) {
     if (opts[key] !== undefined) send[key] = opts[key];
   }
+  // --push: no repository. Hodifly creates an empty one on git.hodifly.app and the answer carries
+  // its address and a push token, shown once.
+  if (opts.push) { send.source = 'push'; delete send.repo; }
   const out = await call(profile, 'create_project', send);
-  show('json', out);
+  if (opts.push && !wantJson()) showPushHandover(out); else show('json', out);
   // The new project is not in the cached index yet, and the very next command is usually about it.
   await reindex(cfg.profiles[profile.name]);
   if (cfg.profiles[profile.name]) writeConfig(cfg);
+}
+
+// The one moment a push token is readable: print it with the two commands that use it.
+function showPushHandover(out, project) {
+  const name = project || out.name || out.id;
+  console.log(`Project ${name} created. Nothing is built until you push.\n`);
+  console.log(`  git remote add hodifly ${out.remote_url}`);
+  console.log(`  git push hodifly ${out.branch || 'main'}\n`);
+  console.log(`git asks for credentials: any username, and this push token as the password. It is`);
+  console.log(`shown ONCE. Keep it in your credential helper, or make another one later with:`);
+  console.log(`  ${PROG} token ${name}\n`);
+  console.log(`  ${out.push_token}`);
+}
+
+// hodifly remote <project>: the address to push to, and the push tokens (never their values).
+async function cmdRemote(args, opts) {
+  const typed = need(args[0], `which project? ${PROG} remote <project>`);
+  const cfg = readConfig();
+  const { profile, subject: project } = pick(cfg, opts, typed);
+  const out = await call(profile, 'list_push_tokens', { project });
+  if (wantJson()) return show('json', out);
+  console.log(`${out.remote_url}   (branch ${out.branch || 'main'})\n`);
+  const live = (out.tokens || []).filter((t) => !t.revoked);
+  if (!live.length) return console.log(`No push token yet: ${PROG} token ${typed}`);
+  table(live.map((t) => [t.id, t.label || '', when(t.created), when(t.last_used)]), ['ID', 'LABEL', 'CREATED', 'LAST USED']);
+}
+
+// hodifly token <project> [--label L] | --revoke ID
+async function cmdToken(args, opts) {
+  const typed = need(args[0], `which project? ${PROG} token <project> [--label laptop] [--revoke ID]`);
+  const cfg = readConfig();
+  const { profile, subject: project } = pick(cfg, opts, typed);
+  if (opts.revoke) {
+    return show('json', await call(profile, 'revoke_push_token', { project, token_id: String(opts.revoke) }));
+  }
+  const out = await call(profile, 'create_push_token', { project, label: typeof opts.label === 'string' ? opts.label : '' });
+  if (wantJson()) return show('json', out);
+  warnSecretsOnTty();
+  console.log(`New push token for ${typed} (shown once):\n\n  ${out.push_token}\n`);
+  console.log(`  git remote add hodifly ${out.remote_url}`);
+  console.log(`  git push hodifly ${out.branch || 'main'}`);
 }
 
 // Change settings on a project that already exists. A PATCH: only what you name is sent, and
@@ -1099,7 +1145,7 @@ function need(v, msg) {
 // --flag value, or --flag on its own for a switch. Dashes become underscores, so --root-directory
 // arrives as root_directory: the name the API uses. The SWITCHES never take a value, so a
 // positional after them stays a positional (`env --show my-site`, `ls --prod my-site`).
-const SWITCHES = new Set(['show', 'build_only', 'deploy', 'replace', 'yes', 'prod', 'production']);
+const SWITCHES = new Set(['show', 'build_only', 'deploy', 'replace', 'yes', 'prod', 'production', 'push']);
 
 function parse(argv) {
   const args = [];
@@ -1130,6 +1176,9 @@ function usage() {
 
   ${PROG} projects                             list your projects and their status
   ${PROG} projects add --repo O/R --domain D   set up a new project from a repository
+  ${PROG} projects add --push --domain D       ... or from nothing: you push the code to Hodifly
+  ${PROG} remote <project>                     the address to push to, and the push tokens
+  ${PROG} token <project> [--revoke ID]        a new push token (shown once), or revoke one
   ${PROG} projects set <project> --startup F   change settings on an existing project
   ${PROG} deploy <project>                     build and publish the current branch head
   ${PROG} ls <project> [--prod]                list deployments, newest first
@@ -1152,7 +1201,10 @@ function usage() {
 picks the right server on its own; add --profile <name> when you want to be explicit.
 
 Options for "projects add", named as Vercel names them:
-  --repo O/R            the git repository                       (required)
+  --repo O/R            the git repository                       (required, unless --push)
+  --push                no repository: Hodifly hosts one on git.hodifly.app and you push to it;
+                        the first push detects the framework and deploys
+  --name N              name of a --push project                 (default: from the domain)
   --domain D            the domain on your account to publish to (required)
   --directory D         subfolder under that domain, e.g. blog
   --branch B            branch to deploy      (default: the repository's own)
@@ -1192,6 +1244,7 @@ const COMMANDS = {
   rollback: cmdRollback,
   logs: cmdLogs, log: cmdLogs,
   remove: cmdRemove, rm: cmdRemove, delete: cmdRemove,
+  remote: cmdRemote, tokens: cmdRemote, token: cmdToken,
   env: cmdEnv,
   db: cmdDb, database: cmdDb, databases: cmdDb,
 };
